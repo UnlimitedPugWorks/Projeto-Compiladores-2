@@ -1,0 +1,6 @@
+program
+ array n[10] := 1,2,4;
+ number i := 0
+start
+	2^3!
+end

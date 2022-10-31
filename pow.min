@@ -1,0 +1,10 @@
+module
+function public number pow number base ; number expoente do
+  number i;
+  number f;
+  f := 1;
+  for i := 1 until i > expoente step i := i + 1 do
+    f := f * base;
+  done
+  return f
+end

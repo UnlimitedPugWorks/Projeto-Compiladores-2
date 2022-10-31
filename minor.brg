@@ -1,0 +1,591 @@
+%{
+/*
+ * selecção de instruções com postfix
+ */
+#include <stdio.h>
+#include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+#include "node.h"
+#include "postfix.h"
+#include "y.tab.h"
+#include "minor.h"
+#include "tabid.h"
+
+#ifndef U_
+#define U_ "_"
+#endif
+
+#define TRACE
+static void yytrace(NODEPTR_TYPE p, int eruleno, int cost, int bestcost);
+
+#define PLUS 1
+#define MINUS -1
+
+extern FILE *yyout;
+static char *mklbl(int n) {
+	static char buf[20];
+	sprintf(buf, "%cL%d", n < 0 ? '.' : '_', n);
+	return strcpy(malloc(strlen(buf)+1),buf);
+}
+static char *mkfunc(char *s) {
+	static char buf[80];
+	strcpy(buf, "_");
+	strcat(buf, s);
+	return buf;
+}
+static void outstr(char *s) {
+  while (*s)fprintf(yyout, pfCHAR, (unsigned char)*s++);
+  fprintf(yyout, pfCHAR, 0);
+}
+
+static void outstrnoend(char *s){
+	  while (*s)fprintf(yyout, pfCHAR, (unsigned char)*s++);
+}
+
+static int isInt(Node *n)  {int i = (tTYPE(n->info) == tINT)?1:10000; /*printf("Como int deu %d\n", i);*/ return i;}
+static int isSTR(Node *n)  {int i = (tTYPE(n->info) == tSTR)?1:10000; /*printf("Como Str deu %d\n", i);*/ return i;}
+static int isArray(Node *n){int i = (tTYPE(n->info) == tVEC)?1:10000; /*printf("Como Array deu %d\n", i);*/ return i;}
+static int sameVar(Node* p) {return strcmp(RIGHT_CHILD(p)->value.s, LEFT_CHILD(LEFT_CHILD(p))->value.s) ? 0x7fff : 2;}
+static int sameVar2(Node* p) {return strcmp(RIGHT_CHILD(p)->value.s, RIGHT_CHILD(LEFT_CHILD(p))->value.s) ? 0x7fff : 2;}
+
+
+void putIntIDinStack(char*);
+void saveIDfromStack(char*);
+void putVecIDinStack(char*);
+void putSTRIDinStack(char*);
+void publicInitialization(char*, int);
+void vectorSaveElement(char*);
+void vectorLoadElement(char*);
+void constInitialization(int);
+void createVecWithLength(char*, int, int);
+void manageExterns(char*);
+void externs();
+void printNode2(Node*);
+void allocVECSTR(char*);
+void incrementOptimization(char*, int, int);
+void showAddress(char*);
+void VectorInit(int, int);
+
+int lbl = 0;
+int depth = -1;
+int elifdepth = -1;
+int localpos = 0;
+int argspos = 8;
+static long eliflbl[20];
+static long brklbl[20];
+static long steplbl[20];
+static char *extrns[100]; /* emit externs at the end only */
+static int extcnt;
+
+%}
+%include "y.tab.h"
+%term STMT=';'
+%term EQUALS='=' ADD='+' SUB='-' MUL='*' DIV='/' MOD='%' POW='^' LESS='<' GREATER='>'
+%term AND='&' OR='|' NOT='~' PRINT='!' READ='?' VECTOR='[' ALLOC='#' FUNCALL='(' ARGSLIST=','
+%start file
+%%
+
+%! program start
+file: PROGRAM(enddecls, main)                  1{fprintf(yyout, pfIMM pfPOP pfLEAVE pfRET pfLEAVE pfRET, 0);}
+file: MODULE(moduledecls)                      1{}
+main: FUNCTION(END(ID,INT),FARGS(NIL,start))   1{}
+start: START(mainfuncdecls,insts)              1{IDpop();}
+mainfuncdecls:NIL                              1{fprintf(yyout, pfENTER, 0); localpos = 0;}
+mainfuncdecls:mainfuncvars                     1{printf("o local é %d\n",localpos); fprintf(yyout, pfENTER, -localpos); localpos = 0;}
+mainfuncvars:ARGS(NIL,mainfuncvar)             1{}
+mainfuncvars:ARGS(mainfuncvars,mainfuncvar)    1{}
+mainfuncvar:NUMBER(ID,NIL)                     1{localpos-=4; int* ptr = (int*)malloc(sizeof(int)); *ptr = localpos; IDnew(tINT+tLOCAL, LEFT_CHILD(p)->value.s, (void*)ptr); }
+mainfuncvar:STRING(ID,NIL)                     1{localpos-=4; int* ptr = (int*)malloc(sizeof(int)); *ptr = localpos; IDnew(tSTR+tLOCAL, LEFT_CHILD(p)->value.s, (void*)ptr); }
+mainfuncvar:ARRAY(ID,INTS(INT,NIL))            1{localpos-=4; int* ptr = (int*)malloc(sizeof(int)); *ptr = localpos; IDnew(tVEC+tLOCAL, LEFT_CHILD(p)->value.s, (void*)ptr); }
+
+%! instructions
+insts:NIL                              1 {}
+insts:STMT(insts,inst)                 1 {}
+inst:PRINT(expr)             		       1 {fprintf(yyout, pfCALL pfTRASH, "_printi", pfWORD);}
+inst:PRINT(sexpr)            		       1 {fprintf(yyout, pfCALL pfTRASH, "_prints", pfWORD);}
+inst:expr                              1 {}
+inst:ALLOC(expr,ID)                    1 {allocVECSTR(RIGHT_CHILD(p)->value.s);}
+
+
+%! stop and repeat
+loop:REPEAT                         1{fprintf(yyout, pfJMP, mklbl(steplbl[depth]));}
+loop:STOP                           1{fprintf(yyout, pfJMP, mklbl(brklbl[depth]));} 
+loop:ret                            1{}
+ret:RETURN(NIL)                  	1{fprintf(yyout, pfLEAVE pfRET);}
+ret:RETURN(expr)                 	1{fprintf(yyout, pfPOP pfLEAVE pfRET);}
+ret:NIL                          	1{}
+
+block:STMT(insts,loop)              1{}
+
+
+
+
+%! ifs
+inst:FI(THEN(ifinst,NIL),NIL)           1 {}
+ifinst:IF(cond,block)                   1 {fprintf(yyout, pfLABEL, mklbl(LEFT_CHILD(p)->place));}
+cond:expr                               1 {p->place = ++lbl; fprintf(yyout, pfJZ, mklbl(p->place));}
+
+%! ifelse
+inst:FI(THEN(if,NIL),elseinst)      1 {fprintf(yyout, pfLABEL, mklbl(LEFT_CHILD(LEFT_CHILD(p))->place));}
+if: IF(cond, block)                 1 {p->place = ++lbl; fprintf(yyout, pfJMP pfLABEL,mklbl(p->place), mklbl(LEFT_CHILD(p)->place));}
+elseinst:block                      1 {}
+
+%! ifelif
+inst:FI(THEN(elifif,elifinst),elifelse) 1 {fprintf(yyout, pfLABEL, mklbl(eliflbl[elifdepth])); elifdepth--;}
+elifif: IF(cond, block)             	1 {elifdepth++; p->place = ++lbl; eliflbl[elifdepth] = p->place; fprintf(yyout, pfJMP pfLABEL,mklbl(eliflbl[elifdepth]), mklbl(LEFT_CHILD(p)->place));}
+elifinst:ELIF(elifinst,elif)        	1 {}
+elif:IF(cond, block)                	1 {fprintf(yyout, pfJMP pfLABEL,mklbl(eliflbl[elifdepth]), mklbl(LEFT_CHILD(p)->place));}
+elifinst:NIL                        	1 {}
+elifelse:block                      	1 {}
+elifelse:NIL                        	1 {}
+
+%! for
+inst:FOR(until,step)                1{fprintf(yyout,pfJMP pfLABEL, mklbl(LEFT_CHILD(p)->place),mklbl(brklbl[depth])); depth--;}
+until:UNTIL(forinit,untilinit)      1{p->place = LEFT_CHILD(p)->place;}
+forinit:expr                        1{lbl++; fprintf(yyout, pfLABEL, mklbl(lbl)); p->place = lbl; depth++;}
+untilinit:expr                      1{lbl++; brklbl[depth] = lbl; fprintf(yyout, pfJNZ, mklbl(lbl)); lbl++; steplbl[depth] = lbl;}
+step:STEP(doinit,stepinit)          1{}
+stepinit:expr                       1{}
+doinit:block                        1{fprintf(yyout, pfLABEL, mklbl(steplbl[depth]));}
+
+
+%! declarations
+enddecls: gdecls                          1 {fprintf(yyout, pfTEXT pfALIGN pfGLOBL pfLABEL, mkfunc("main"), pfFUNC, mkfunc("main"));IDpush();}
+moduledecls: gdecls                       1 {}
+gdecls: NIL                               1 {}
+gdecls: decls                             1 {}
+decls: DECL(NIL,decl)                     1 {}
+decls: DECL(decls,decl)                   1 {}
+decl:VAR(NUMBER(ID,INT))                  1 {constInitialization(p->info); publicInitialization(LEFT_CHILD(LEFT_CHILD(p))->value.s, p->info); fprintf(yyout, pfINTEGER, RIGHT_CHILD(LEFT_CHILD(p))->value.i); manageExterns(LEFT_CHILD(LEFT_CHILD(p))->value.s);}
+decl:VAR(NUMBER(ID,NIL))                  1 {if(!(p->info&tFWD)){fprintf(yyout, pfBSS pfALIGN);  publicInitialization(LEFT_CHILD(LEFT_CHILD(p))->value.s, p->info); fprintf(yyout, pfBYTE pfTEXT, pfWORD);}else{extrns[extcnt++] = strdup(LEFT_CHILD(LEFT_CHILD(p))->value.s);}}
+decl:VAR(STRING(ID,charsdecl))            1 {fprintf(yyout, pfCHAR,0); constInitialization(p->info); publicInitialization(LEFT_CHILD(LEFT_CHILD(p))->value.s, p->info); fprintf(yyout, pfID pfTEXT, mklbl(lbl));manageExterns(LEFT_CHILD(LEFT_CHILD(p))->value.s);}
+decl:VAR(STRING(ID,NIL))                  1 {if(!(p->info&tFWD)){fprintf(yyout, pfBSS  pfALIGN); publicInitialization(LEFT_CHILD(LEFT_CHILD(p))->value.s, p->info); fprintf(yyout, pfBYTE pfTEXT, pfWORD);}else{extrns[extcnt++] = strdup(LEFT_CHILD(LEFT_CHILD(p))->value.s);}}
+decl:VAR(ARRAY(ID,INTS(INT,arraydecl)))   1 {VectorInit(LEFT_CHILD(RIGHT_CHILD(LEFT_CHILD(p)))->value.i,RIGHT_CHILD(RIGHT_CHILD(LEFT_CHILD(p)))->place) ;constInitialization(p->info); publicInitialization(LEFT_CHILD(LEFT_CHILD(p))->value.s, p->info); fprintf(yyout, pfID pfTEXT, mklbl(lbl)); lbl++; manageExterns(LEFT_CHILD(LEFT_CHILD(p))->value.s);}
+%! decl:VAR(ARRAY(ID,INTS(INT,NIL)))      1 {if(!(p->info&tFWD)){fprintf(yyout, pfBSS  pfALIGN); publicInitialization(LEFT_CHILD(LEFT_CHILD(p))->value.s, p->info); fprintf(yyout, pfBYTE pfTEXT, pfWORD);}else{extrns[extcnt++] = strdup(LEFT_CHILD(LEFT_CHILD(p))->value.s);}}
+decl:VAR(ARRAY(ID,INTS(INT,NIL)))         1 {createVecWithLength(LEFT_CHILD(LEFT_CHILD(p))->value.s, LEFT_CHILD(RIGHT_CHILD(LEFT_CHILD(p)))->value.i, p->info);}
+
+
+arraydecl:intlist                         1 {}
+intlist:INT                               1 {p->place = 1; fprintf(yyout, pfDATA pfLABEL pfINTEGER, mklbl(lbl), p->value.i);}
+intlist:INTS(intlist, INT)                1 {fprintf(yyout, pfINTEGER, RIGHT_CHILD(p)->value.i); p->place = LEFT_CHILD(p)->place + 1;}
+
+%! funcdeclarations
+ decl:FUNCTION(funcend, funcfargs)      1 {printf("O nome da funcao é %s e o meu tipo é %d\n",LEFT_CHILD(LEFT_CHILD(p))->value.s,RIGHT_CHILD(LEFT_CHILD(p))->value.i);long type = RIGHT_CHILD(LEFT_CHILD(p))->value.i; if(!(type&tFWD)){printf("Vou entrar aqui\n");fprintf(yyout, pfLEAVE pfRET);}IDpop();}
+ funcend:END(ID,INT)                    1 {if(!(RIGHT_CHILD(p)->value.i&tFWD)){fprintf(yyout, pfTEXT pfALIGN pfGLOBL pfLABEL, mkfunc(LEFT_CHILD(p)->value.s), pfFUNC, mkfunc(LEFT_CHILD(p)->value.s)); manageExterns(mkfunc(LEFT_CHILD(p)->value.s));}else{extrns[extcnt++] = strdup(mkfunc(LEFT_CHILD(p)->value.s));} p->place = RIGHT_CHILD(p)->value.i; IDpush();}
+ funcfargs:FARGS(fvardecl,funcbody)     1 {}
+ funcfargs:FARGS(NIL, funcbody)         1 {}
+
+%! function arguments
+   fvardecl:fvars                         1 {argspos = 8;}
+   fvars:ARGS(NIL,fvar)                   1 {}
+   fvars:ARGS(fvars,fvar)                 1 {}
+   fvar:NUMBER(ID,NIL)                    1 {int* ptr = (int*)malloc(sizeof(int)); *ptr = argspos; IDnew(tLOCAL+tINT, LEFT_CHILD(p)->value.s, (void*)ptr); argspos+=4;}
+   fvar:STRING(ID,NIL)                    1 {int* ptr = (int*)malloc(sizeof(int)); *ptr = argspos; IDnew(tLOCAL+tSTR, LEFT_CHILD(p)->value.s, (void*)ptr); argspos+=4;}
+   fvar:ARRAY(ID,INTS(INT,NIL))           1 {int* ptr = (int*)malloc(sizeof(int)); *ptr = argspos; IDnew(tLOCAL+tVEC, LEFT_CHILD(p)->value.s, (void*)ptr); argspos+=4;}
+
+
+%! function body
+   funcbody:NIL                           1{}
+   funcbody:START(funcdecls,funcinsts)    1{}
+   funcdecls:NIL                          1{fprintf(yyout, pfENTER, 0); localpos = 0;}
+   funcdecls:funcvars                     1{fprintf(yyout, pfENTER, -localpos); localpos = 0;}
+   funcvars:ARGS(NIL,funcvar)             1{}
+   funcvars:ARGS(funcvars,funcvar)        1{}
+   funcvar:NUMBER(ID,NIL)                 1{localpos-=4;int* ptr = (int*)malloc(sizeof(int)); *ptr = localpos; IDnew(tLOCAL+tINT, LEFT_CHILD(p)->value.s, (void*)ptr);}
+   funcvar:STRING(ID,NIL)                 1{localpos-=4;int* ptr = (int*)malloc(sizeof(int)); *ptr = localpos; IDnew(tLOCAL+tSTR, LEFT_CHILD(p)->value.s, (void*)ptr);}
+   funcvar:ARRAY(ID,INTS(INT,NIL))        1{localpos-=4;int* ptr = (int*)malloc(sizeof(int)); *ptr = localpos; IDnew(tLOCAL+tVEC, LEFT_CHILD(p)->value.s, (void*)ptr);}
+   funcinsts:NIL                          1{}
+   funcinsts:STMT(insts,ret)              1{}
+
+
+chars:CHARS(chars,char)               1 {p->place = LEFT_CHILD(p)->place;}
+chars:NIL                             1 {char* strlbl = mklbl(++lbl); fprintf(yyout, pfRODATA pfALIGN pfLABEL, strlbl);p->place = lbl;}
+char:INT                              1 {fprintf(yyout, pfCHAR, p->value.i);}
+char:STR                              1 {outstrnoend(p->value.s);}
+char:CHAR                             1 {fprintf(yyout, pfCHAR, p->value.i);}
+
+
+ charsdecl:CHARS(charsdecl,char)      1{p->place = LEFT_CHILD(p)->place;}
+ charsdecl:NIL                        1{lbl++; fprintf(yyout, pfDATA pfALIGN pfLABEL, mklbl(lbl)); p->place = lbl;}
+
+exprs:ARGSLIST(expr,NIL)               1{p->place = 1;}
+exprs:ARGSLIST(expr,exprs)             1{p->place = 1 + RIGHT_CHILD(p)->place;}
+
+%! expressions
+expr:FUNCALL(ID,exprs)                 1 {fprintf(yyout, pfCALL pfTRASH pfPUSH, mkfunc(LEFT_CHILD(p)->value.s),(int)(pfWORD*(RIGHT_CHILD(p)->place)));}
+expr:sexpr                             1 {}
+expr:vexpr                             1 {}
+expr:EQ(expr,ID)                       1 {saveIDfromStack(RIGHT_CHILD(p)->value.s);}
+expr:EQ(ADD(ID,CHARS(NIL,INT)),ID)      sameVar {incrementOptimization(RIGHT_CHILD(p)->value.s,RIGHT_CHILD(RIGHT_CHILD(LEFT_CHILD(p)))->value.i, PLUS);}
+expr:EQ(ADD(CHARS(NIL,INT),ID),ID)      sameVar2 {incrementOptimization(RIGHT_CHILD(p)->value.s,RIGHT_CHILD(LEFT_CHILD(LEFT_CHILD(p)))->value.i, PLUS);}
+expr:EQ(SUB(ID,CHARS(NIL,INT)),ID)      sameVar {incrementOptimization(RIGHT_CHILD(p)->value.s,RIGHT_CHILD(RIGHT_CHILD(LEFT_CHILD(p)))->value.i, MINUS);}
+expr:READ                              1 {fprintf(yyout, pfCALL pfPUSH, "_readi");}
+expr:ID                            isInt {putIntIDinStack(p->value.s);}
+expr:ADDR(ID)                          1 {showAddress(LEFT_CHILD(p)->value.s);}
+expr:SUB(expr,expr)                    isInt {fprintf(yyout, pfSUB);}
+expr:ADD(expr,expr)                    isInt {fprintf(yyout, pfADD);}
+vexpr:ADD(expr,vexpr)                  isArray {fprintf(yyout, pfSWAP pfIMM pfMUL pfADD, 4);}
+vexpr:ADD(vexpr,expr)                  isArray {fprintf(yyout, pfIMM pfMUL pfADD, 4);}
+vexpr:SUB(expr,vexpr)                  isArray {fprintf(yyout, pfSWAP pfIMM pfMUL pfSUB, 4);}
+vexpr:SUB(vexpr,expr)                  isArray {fprintf(yyout, pfIMM pfMUL pfSUB, 4);}
+expr:ADD(CHARS(NIL,INT),CHARS(NIL,INT)) 1 {fprintf(yyout,pfIMM,RIGHT_CHILD(LEFT_CHILD(p))->value.i + RIGHT_CHILD(RIGHT_CHILD(p))->value.i);}
+expr:SUB(CHARS(NIL,INT),CHARS(NIL,INT)) 1 {fprintf(yyout,pfIMM,RIGHT_CHILD(LEFT_CHILD(p))->value.i - RIGHT_CHILD(RIGHT_CHILD(p))->value.i);}
+expr:MUL(CHARS(NIL,INT),CHARS(NIL,INT)) 1 {fprintf(yyout,pfIMM,RIGHT_CHILD(LEFT_CHILD(p))->value.i * RIGHT_CHILD(RIGHT_CHILD(p))->value.i);}
+expr:DIV(CHARS(NIL,INT),CHARS(NIL,INT)) 1 {fprintf(yyout,pfIMM,RIGHT_CHILD(LEFT_CHILD(p))->value.i / RIGHT_CHILD(RIGHT_CHILD(p))->value.i);}
+expr:MUL(expr,expr)                    1 {fprintf(yyout, pfMUL);}
+expr:DIV(expr,expr)                    1 {fprintf(yyout, pfDIV);}
+expr:AND(and,expr)				             1 { fprintf(yyout, pfLABEL, mklbl(LEFT_CHILD(p)->place)); }
+and:expr						                   1 { p->place = ++lbl; fprintf(yyout, pfDUP pfJZ pfTRASH, mklbl(p->place), pfWORD); }
+expr:OR(or,expr)					             1 { fprintf(yyout, pfLABEL, mklbl(LEFT_CHILD(p)->place)); }
+or:	expr							                 1 { p->place = ++lbl; fprintf(yyout, pfDUP pfJNZ pfTRASH, mklbl(p->place), pfWORD); }
+expr:NOT(expr)                         1 {fprintf(yyout, pfIMM pfEQ, 0);}
+expr:MOD(expr,expr)                    1 {fprintf(yyout, pfMOD);}
+expr:GREATER(expr,expr)                1 {fprintf(yyout, pfGT);}
+expr:GREATER(sexpr,sexpr)              1 {fprintf(yyout, pfCALL pfTRASH pfPUSH pfIMM pfGT, "_strcmp", 8, 0);}
+expr:LESS(expr,expr)                   1 {fprintf(yyout, pfLT);}
+expr:LESS(sexpr,sexpr)                 1 {fprintf(yyout, pfCALL pfTRASH pfPUSH pfIMM pfLT, "_strcmp", 8, 0);}
+expr:EQUALS(expr,expr)                 1 {fprintf(yyout, pfEQ);}
+expr:EQUALS(sexpr,sexpr)               1 {fprintf(yyout, pfCALL pfTRASH pfPUSH pfIMM pfEQ, "_strcmp", 8, 0);}
+expr:GE(expr,expr)                     1 {fprintf(yyout, pfGE);}
+expr:GE(sexpr,sexpr)                   1 {fprintf(yyout, pfCALL pfTRASH pfPUSH pfIMM pfGE, "_strcmp", 8, 0);}  
+expr:LE(expr,expr)                     1 {fprintf(yyout, pfLE);}
+expr:LE(sexpr,sexpr)                   1 {fprintf(yyout, pfCALL pfTRASH pfPUSH pfIMM pfLE, "_strcmp", 8, 0);}
+expr:NE(expr,expr)                     1 {fprintf(yyout, pfNE);}
+expr:NE(sexpr,sexpr)                   1 {fprintf(yyout, pfCALL pfTRASH pfPUSH pfIMM pfNE, "_strcmp", 8, 0);}
+expr:uminus(expr)                      1 {fprintf(yyout, pfNEG);}
+expr:POW(expr,expr)                    1 {fprintf(yyout, pfCALL pfTRASH pfPUSH, "_power", 8);}
+expr:CHARS(NIL,INT)                isInt {fprintf(yyout, pfIMM, (RIGHT_CHILD(p)->value.i));}
+expr:CHARS(NIL,CHAR)               isInt {fprintf(yyout, pfIMM, (char)(RIGHT_CHILD(p)->value.i));}
+sexpr:CHARS(chars,char)            isSTR {lbl++; fprintf(yyout, pfCHAR pfTEXT pfADDR, 0, mklbl(LEFT_CHILD(p)->place));}
+sexpr:ID                           isSTR {putSTRIDinStack(p->value.s);}
+expr:EQ(expr,VECTOR(expr,sexpr))       1 {fprintf(yyout, pfADD pfSTCHR);}
+expr:VECTOR(expr,sexpr)                1 {fprintf(yyout, pfADD pfLDCHR);}
+expr:VECTOR(expr,vexpr)               1 {fprintf(yyout, pfSWAP pfIMM pfMUL pfADD pfLOAD, 4);}
+expr:EQ(expr,VECTOR(expr,vexpr))      1 {fprintf(yyout, pfSWAP pfIMM pfMUL pfADD pfSTORE, 4);}
+vexpr:ID                         isArray {putVecIDinStack(p->value.s);}
+%%
+
+/*%! expr:POW(expr,expr)                 1 {lbl++; char* powlbl = mklbl(lbl);lbl++; char* startlbl = mklbl(lbl); lbl++; char* endlbl = mklbl(lbl); fprintf(yyout,pfBSS pfALIGN pfLABEL pfTEXT pfADDRA,powlbl,powlbl); fprintf(yyout,pfIMM pfSWAP pfIMM pfADD pfSWAP pfTEXT pfLABEL pfSWAP pfIMM pfSUB pfDUP pfJZ pfSWAP pfADDRV pfMUL pfJMP pfLABEL pfTRASH,1,1, startlbl, 1, endlbl, powlbl, startlbl, endlbl,pfWORD);}
+*/
+
+extern char **yynames;
+extern int trace, errors, debugNode;
+
+
+void printNode2(Node *p){
+	printNode(p,0,yynames);
+}
+
+void externs(){
+  int i;
+  
+  for (i = 0; i < extcnt; i++)
+    if (extrns[i])
+      fprintf(yyout, pfEXTRN, extrns[i]);
+}
+
+void manageExterns(char* name){
+	int i;
+	for(i = 0; i < extcnt; i++){
+			if (extrns[i] && strcmp(extrns[i], name) == 0) extrns[i] = 0;
+		}
+	}
+
+
+void evaluate(Node *p) {
+	if (errors) return;
+	/* if (trace) */ printNode(p, stdout, yynames);
+	/*printNode2(p);*/
+	if (!yyselect(p) && trace) printf("selection successful\n");
+	/*printNode2(p);*/
+	fprintf(yyout, pfEXTRN pfEXTRN pfEXTRN pfEXTRN, "_prints", "_println", "_printi", "_readi");
+	fprintf(yyout, pfEXTRN, "_power");
+	fprintf(yyout, pfEXTRN, "_strcmp");
+	externs();
+}
+
+void putIntIDinStack(char* name){
+	printf("O ID que vai ser carregado é %s\n", name);
+	int* ptr;
+	/*void** ptr*/
+	int local;
+	/*IDprint(0,2);*/
+	int info = 0;
+	/*info = IDfind(name,ptr);*/
+	info = IDfind(name,(void**)&ptr);
+	if(info&tFUNC){
+		fprintf(yyout, pfCALL pfPUSH, mkfunc(name));
+	}
+	else if(info&tLOCAL){
+		/*local = *((int*)ptr[0]);*/
+		local = *ptr;
+		printf("No load a variavel %s tem %d\n",name, local);
+		fprintf(yyout, pfLOCV,  local);
+	}
+	else{
+		printf("No load a variavel %s é global\n",name);
+		fprintf(yyout, pfADDR pfLOAD, name);
+	}
+}
+
+void saveIDfromStack(char* name){
+    printf("O ID que vai ser guardado é %s\n", name);
+	/*void** ptr;*/
+	int* ptr;
+	int local;
+	int info;
+	/*info = IDfind(name,ptr);*/
+	info = IDfind(name,(void**)&ptr);
+	IDprint(0,2);
+  fprintf(yyout,pfDUP);
+	if(info&tLOCAL){
+		/*local = *((int*)ptr[0]);*/
+		local = *ptr;
+		printf("No save a variavel %s tem %d\n",name, local);
+		fprintf(yyout, pfLOCA, local);
+	}
+	else{
+		printf("No save a variavel %s é global\n",name);
+		fprintf(yyout, pfADDRA, name);
+	}
+}
+
+void VectorInit(int length, int place){
+  int i;
+  if(length > place){
+    for(i = place; i < length; i++){
+      fprintf(yyout, pfINTEGER, 0);
+    }
+  }
+  fprintf(yyout, pfDATA pfTEXT);
+}
+
+
+
+void putVecIDinStack(char* name){
+	/*void** ptr;*/
+	int* ptr;
+	int local;
+	/*int info = IDfind(name,ptr);*/
+	int info = IDfind(name,(void**)&ptr);
+	if(info&tFUNC){
+		fprintf(yyout, pfCALL pfPUSH, name);
+	}
+	else if(info&tLOCAL){
+		local = *ptr;
+		/*local = *((int*)ptr[0]);*/
+		printf("A variavel %s tem %d\n",name, local);
+		fprintf(yyout, pfLOCV,  local);
+	}
+	else{
+		fprintf(yyout, pfADDRV, name);
+	}
+}
+
+void putSTRIDinStack(char* name){
+	/*void** ptr;*/
+	int* ptr;
+	int local;
+	/*int info = IDfind(name,ptr);*/
+	int info = IDfind(name, (void**)&ptr);
+	if(info&tFUNC){
+		fprintf(yyout, pfCALL pfPUSH, name);
+	}
+	else if(info&tLOCAL){
+		/*local = *((int*)ptr[0]);*/
+		local = *ptr;
+		printf("A variavel %s tem %d\n",name, local);
+		fprintf(yyout, pfLOCV,  local);
+	}
+	else{
+		fprintf(yyout, pfADDRV, name);
+	}
+}
+
+void createVecWithLength(char* name, int length, int info){
+	if(!(info&tFWD)){
+		if(length != 0){
+			lbl++;
+			fprintf(yyout,pfBSS pfLABEL pfBYTE, mklbl(lbl), 4*length);
+			fprintf(yyout,pfDATA);
+			publicInitialization(name,info);
+			fprintf(yyout, pfID pfTEXT, mklbl(lbl));
+		}
+		else{
+			fprintf(yyout, pfBSS  pfALIGN);
+			publicInitialization(name, info);
+			fprintf(yyout, pfBYTE pfTEXT, pfWORD);
+		}
+	}
+	else{
+		extrns[extcnt++] = strdup(name);
+	}
+}
+
+
+void incrementOptimization(char* name, int value, int sign){
+  int* ptr;
+  int local;
+  int info = IDfind(name, (void**)&ptr);
+  int inc = value;
+  printf("O tipo do variavel é %d\n",info);
+  printf("O value é value %d\n",value);
+  if(info&tLOCAL){
+    local = *ptr;
+    fprintf(yyout, pfLOCAL, local);
+  }
+  else{
+    fprintf(yyout, pfADDR, name);
+  }
+  if(tTYPE(info)==tVEC){
+    printf("Entra aqui");
+    inc = 4*inc;
+  }
+  fprintf(yyout,pfDUP);
+  (sign == PLUS)?fprintf(yyout, pfINCR, inc):fprintf(yyout, pfDECR, inc);
+   if(info&tLOCAL){
+    local = *ptr;
+    fprintf(yyout, pfLOCV, local);
+  }
+  else{
+    fprintf(yyout, pfADDRV, name);
+  }
+}
+
+
+void showAddress(char* name){
+  int* ptr;
+  int  local;
+  int info = IDfind(name,(void**)&ptr);
+  if(info&tLOCAL){
+    local = *ptr;
+    fprintf(yyout, pfLOCAL, local);
+  }
+  else{
+    fprintf(yyout, pfADDR, name);
+  }
+}
+
+
+void allocVECSTR(char* name){
+	int* ptr;
+	int local;
+	int info = IDfind(name, (void**)&ptr);
+	if(info&tLOCAL){
+		local = *ptr;
+		if(tTYPE(info)&tVEC){
+			fprintf(yyout, pfIMM pfMUL pfALLOC pfSP,4);
+		}
+		else{
+			fprintf(yyout, pfALLOC pfSP);
+		}
+		fprintf(yyout, pfLOCAL pfSTORE, local);
+	}
+	else{
+		if(tTYPE(info)&tVEC){
+			fprintf(yyout, pfIMM pfMUL pfALLOC pfSP,4);
+		}
+		else{
+			fprintf(yyout, pfALLOC pfSP);
+		}
+		fprintf(yyout, pfADDR pfSTORE, name);
+	}
+}
+
+/*void vectorSaveElement(char* name){
+	void** ptr;
+	int local;
+	int info = IDfind(name,ptr);
+	if(info&tLOCAL){
+		local = *((int*)ptr[0]);
+		if(tTYPE(info)==tVEC){
+			fprintf(yyout,pfIMM pfMUL pfLOCAL pfLOAD pfSTORE,pfWORD, local);
+		}
+		else if(tTYPE(info)==tSTR){
+			fprintf(yyout, pfLOCAL pfLOAD pfADD pfSTCHR, local );
+		}
+	}
+	else{
+		if(tTYPE(info)==tVEC){
+			fprintf(yyout, pfIMM pfMUL pfADDR pfLOAD pfADD pfSTORE,pfWORD,name);
+		}
+		else if(tTYPE(info)==tSTR){
+			fprintf(yyout, pfADDR pfLOAD pfADD pfSTCHR, name);
+		}
+	}
+}
+
+void vectorLoadElement(char* name){
+
+	void** ptr;
+	int local;
+	int info = IDfind(name,ptr);
+	if(info&tLOCAL){
+		local = *((int*)ptr[0]);
+		if(tTYPE(info)==tVEC){
+			fprintf(yyout,pfIMM pfMUL pfLOCAL pfLOAD pfLOAD,pfWORD, local);
+		}
+		else if(tTYPE(info)==tSTR){
+			fprintf(yyout, pfLOCAL pfLOAD pfADD pfLDCHR, local);
+		}
+	}
+	else{
+		if(tTYPE(info)==tVEC){
+			fprintf(yyout, pfIMM pfMUL pfADDR pfLOAD pfADD pfLOAD,pfWORD,name);
+		}
+		else if(tTYPE(info)==tSTR){
+			fprintf(yyout, pfADDR pfLOAD pfADD pfLDCHR, name);
+		}
+	}
+}*/
+
+
+
+
+void publicInitialization(char* name, int info){
+	if(info&tPUB){
+		fprintf(yyout,pfGLOBL, name, pfOBJ);
+	}
+	fprintf(yyout,pfLABEL,name);
+}
+
+void constInitialization(int info){
+	if(info&tCNST){
+		fprintf(yyout, pfRODATA pfALIGN);
+	}
+	else{
+		fprintf(yyout, pfDATA pfALIGN);
+	}
+}
+
+
+/*void function(char *name, int enter, Node *stmt)
+{
+  int i;
+  extern int errors, trace;
+  extern char **yynames;
+  if (errors) return;
+  if (trace) printNode(stmt, 0, yynames);
+  fflush(stdout);
+  fprintf(yyout, pfTEXT pfALIGN pfGLOBL pfLABEL pfENTER, mkfunc(name), pfFUNC, mkfunc(name), enter * (pfWORD/4));
+  yyselect(stmt);
+  fprintf(yyout, pfLEAVE pfRET);
+  freeNode(stmt);
+  for (i = 0; i < extcnt; i++)
+    if (extrns[i] && strcmp(extrns[i], mkfunc(name)) == 0) extrns[i] = 0;
+}*/
+
+
+#ifndef NOTRACE
+static void yytrace(NODEPTR_TYPE p, int eruleno, int cost, int bestcost)
+{
+	int op = OP_LABEL(p);
+	YYCONST char *tname = yytermname[op] ? yytermname[op] : "?";
+	if (debugNode) fprintf(stderr, "0x%p:%s matched %s with cost %d vs. %d\n", p, tname, yystring[eruleno], cost, bestcost);
+	if (cost >= MAX_COST && bestcost >= MAX_COST) {
+		fprintf(stderr, "0x%p:%s NO MATCH %s with cost %d vs. %d\n", p, tname, yystring[eruleno], cost, bestcost);
+		printNode(p, stderr, yynames);
+	}
+}
+#endif

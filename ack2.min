@@ -1,0 +1,11 @@
+program
+number cnt := 0;
+function number ackermann number m ; number n do
+  cnt := cnt + 1;
+  if m = 0 then return n+1 fi
+  if n = 0 then return ackermann(m-1, 1) fi
+  return ackermann(m-1, ackermann(m, n-1))
+start
+  ackermann(2, 4)! " #"! cnt! "\n"!
+end
+Fim da funcao de ackermann

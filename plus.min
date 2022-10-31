@@ -1,0 +1,9 @@
+program
+function forward number arr2num array x done;
+function public number arr2num number x do return x
+start
+end
+
+
+
+
